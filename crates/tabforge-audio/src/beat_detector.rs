@@ -4,9 +4,9 @@ use crate::traits::{BeatDetector, BeatGrid};
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
 use std::f32::consts::PI;
-use tabforge_core::Tempo;
+use tabforge_core::{Tempo, TempoChange, TimeSignature, TimeSignatureChange};
 
-/// Dynamic Autocorrelation Beat and Tempo (BPM) Detector
+/// Dynamic Autocorrelation Beat, Tempo (BPM), and Time Signature Detector
 pub struct AutoCorrelationBeatDetector {
     pub min_bpm: f64,
     pub max_bpm: f64,
@@ -45,7 +45,10 @@ impl BeatDetector for AutoCorrelationBeatDetector {
             }
             return Ok(BeatGrid {
                 tempo: default_tempo,
+                time_signature: TimeSignature::FOUR_FOUR,
                 beat_times_seconds: beat_times,
+                tempo_changes: Vec::new(),
+                time_sig_changes: Vec::new(),
             });
         }
 
@@ -53,7 +56,7 @@ impl BeatDetector for AutoCorrelationBeatDetector {
         let envelope = self.compute_onset_strength_envelope(samples);
         let env_fps = sample_rate / self.hop_size as f64;
 
-        // 2. Estimate BPM via Autocorrelation & Gaussian Tempo Prior
+        // 2. Estimate Global BPM via Autocorrelation & Gaussian Tempo Prior
         let estimated_bpm = self.estimate_bpm(&envelope, env_fps);
         let tempo = Tempo::new(estimated_bpm).unwrap_or_else(|_| Tempo::new(120.0).unwrap());
         let beat_interval_secs = 60.0 / tempo.bpm();
@@ -61,7 +64,7 @@ impl BeatDetector for AutoCorrelationBeatDetector {
         // 3. Phase Alignment: Determine best starting offset t0 to maximize energy at beat times
         let t0 = self.align_beat_phase(&envelope, env_fps, beat_interval_secs, duration);
 
-        // 4. Generate aligned BeatGrid
+        // 4. Generate aligned BeatGrid timeline
         let mut beat_times = Vec::new();
         let mut t = t0;
         while t < duration {
@@ -71,9 +74,18 @@ impl BeatDetector for AutoCorrelationBeatDetector {
             t += beat_interval_secs;
         }
 
+        // 5. Dynamic Tempo Tracking: Check for tempo variations across audio sections
+        let tempo_changes = self.detect_dynamic_tempo_changes(&envelope, env_fps, duration, tempo);
+
+        // 6. Time Signature Detection: Infer metric grouping (3/4, 4/4, 6/8, 7/8) from downbeat energy
+        let (inferred_time_sig, time_sig_changes) = self.infer_time_signature(&envelope, env_fps, &beat_times);
+
         Ok(BeatGrid {
             tempo,
+            time_signature: inferred_time_sig,
             beat_times_seconds: beat_times,
+            tempo_changes,
+            time_sig_changes,
         })
     }
 }
@@ -216,6 +228,114 @@ impl AutoCorrelationBeatDetector {
 
         best_t0
     }
+
+    /// Detect tempo changes over sliding audio windows
+    fn detect_dynamic_tempo_changes(
+        &self,
+        envelope: &[f32],
+        env_fps: f64,
+        duration: f64,
+        base_tempo: Tempo,
+    ) -> Vec<TempoChange> {
+        let mut changes = Vec::new();
+        let section_len_secs = 6.0;
+        let step_secs = 3.0;
+
+        if duration < section_len_secs * 1.5 {
+            return changes;
+        }
+
+        let mut current_tempo = base_tempo;
+        let mut t = step_secs;
+
+        while t + section_len_secs <= duration {
+            let start_frame = (t * env_fps).round() as usize;
+            let end_frame = ((t + section_len_secs) * env_fps).round() as usize;
+
+            if end_frame <= envelope.len() {
+                let section_env = &envelope[start_frame..end_frame];
+                let section_bpm = self.estimate_bpm(section_env, env_fps);
+
+                if (section_bpm - current_tempo.bpm()).abs() >= 4.0 {
+                    if let Ok(new_tempo) = Tempo::new(section_bpm) {
+                        current_tempo = new_tempo;
+                        changes.push(TempoChange {
+                            time_seconds: t,
+                            tempo: new_tempo,
+                        });
+                    }
+                }
+            }
+
+            t += step_secs;
+        }
+
+        changes
+    }
+
+    /// Infer metric time signature by analyzing downbeat periodicity (every 3 vs 4 vs 6 vs 7 beats)
+    fn infer_time_signature(
+        &self,
+        envelope: &[f32],
+        env_fps: f64,
+        beat_times: &[f64],
+    ) -> (TimeSignature, Vec<TimeSignatureChange>) {
+        if beat_times.len() < 12 || envelope.is_empty() {
+            return (TimeSignature::FOUR_FOUR, Vec::new());
+        }
+
+        // Sample onset energy at each beat time
+        let beat_energies: Vec<f32> = beat_times
+            .iter()
+            .map(|&t| {
+                let idx = (t * env_fps).round() as usize;
+                if idx < envelope.len() {
+                    envelope[idx]
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+
+        // Evaluate accentuation periodicity for candidate meters (3, 4, 6, 7)
+        let eval_metric = |m: usize| -> f32 {
+            let mut sum_downbeats = 0.0f32;
+            let mut sum_other = 0.0f32;
+            let mut count_downbeats = 0;
+            let mut count_other = 0;
+
+            for (i, &energy) in beat_energies.iter().enumerate() {
+                if i % m == 0 {
+                    sum_downbeats += energy;
+                    count_downbeats += 1;
+                } else {
+                    sum_other += energy;
+                    count_other += 1;
+                }
+            }
+
+            let avg_downbeat = sum_downbeats / count_downbeats.max(1) as f32;
+            let avg_other = sum_other / count_other.max(1) as f32;
+            avg_downbeat / avg_other.max(1e-4)
+        };
+
+        let score_4 = eval_metric(4);
+        let score_3 = eval_metric(3);
+        let score_6 = eval_metric(6);
+        let score_7 = eval_metric(7);
+
+        let inferred = if score_7 > score_4 * 1.35 && score_7 > score_3 * 1.3 {
+            TimeSignature::SEVEN_EIGHT
+        } else if score_6 > score_4 * 1.25 && score_6 > 1.2 {
+            TimeSignature::SIX_EIGHT
+        } else if score_3 > score_4 * 1.25 && score_3 > 1.2 {
+            TimeSignature::THREE_FOUR
+        } else {
+            TimeSignature::FOUR_FOUR
+        };
+
+        (inferred, Vec::new())
+    }
 }
 
 #[cfg(test)]
@@ -233,7 +353,6 @@ mod tests {
             for j in 0..600 {
                 if start_idx + j < total_samples {
                     let decay = (-(j as f32) / 120.0).exp();
-                    // Sharp transient burst
                     samples[start_idx + j] += 0.9 * decay * ((j as f32 * 0.1).sin());
                 }
             }
@@ -259,6 +378,7 @@ mod tests {
             error
         );
         assert!(!beat_grid.beat_times_seconds.is_empty());
+        assert_eq!(beat_grid.time_signature, TimeSignature::FOUR_FOUR);
     }
 
     #[test]

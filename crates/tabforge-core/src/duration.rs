@@ -21,8 +21,11 @@ pub struct Duration(pub Rational32);
 impl Duration {
     pub const ZERO: Self = Self(Rational32::new_raw(0, 1));
     pub const WHOLE: Self = Self(Rational32::new_raw(1, 1));
+    pub const DOTTED_HALF: Self = Self(Rational32::new_raw(3, 4));
     pub const HALF: Self = Self(Rational32::new_raw(1, 2));
+    pub const DOTTED_QUARTER: Self = Self(Rational32::new_raw(3, 8));
     pub const QUARTER: Self = Self(Rational32::new_raw(1, 4));
+    pub const DOTTED_EIGHTH: Self = Self(Rational32::new_raw(3, 16));
     pub const EIGHTH: Self = Self(Rational32::new_raw(1, 8));
     pub const SIXTEENTH: Self = Self(Rational32::new_raw(1, 16));
     pub const THIRTY_SECOND: Self = Self(Rational32::new_raw(1, 32));

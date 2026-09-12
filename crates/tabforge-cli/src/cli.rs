@@ -44,6 +44,9 @@ pub enum Commands {
 
         #[arg(long, default_value = "guitar", help = "Stem to transcribe if separation is enabled")]
         stem: String,
+
+        #[arg(long, help = "Time signature override (e.g. 4/4, 3/4, 6/8, 7/8)")]
+        time_signature: Option<String>,
     },
 
     #[command(about = "Separate audio into individual instrument stems (guitar, bass, drums, vocals, other)")]

@@ -1,5 +1,7 @@
 use crate::error::{AudioError, Result};
-use std::fs;
+use indicatif::{ProgressBar, ProgressStyle};
+use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::path::PathBuf;
 
 /// Metadata and specifications for available neural source separation models
@@ -20,9 +22,9 @@ pub const KNOWN_MODELS: &[ModelInfo] = &[
         name: "htdemucs_6s",
         display_name: "HTDemucs v4 (6-Stems)",
         description: "Meta AI Hybrid Transformer Demucs with dedicated Guitar and Piano stems (SOTA for guitar)",
-        stems: &["guitar", "bass", "drums", "vocals", "piano", "other"],
+        stems: &["drums", "bass", "other", "vocals", "guitar", "piano"],
         sdr_score_db: 9.2,
-        download_url: "https://github.com/facebookresearch/demucs/releases/download/v4.0/htdemucs_6s.onnx",
+        download_url: "https://huggingface.co/StemSplitio/htdemucs-6s-onnx/resolve/main/htdemucs_6s.onnx",
         filename: "htdemucs_6s.onnx",
         size_mb: 118.0,
     },
@@ -30,9 +32,9 @@ pub const KNOWN_MODELS: &[ModelInfo] = &[
         name: "htdemucs_4s",
         display_name: "HTDemucs v4 (4-Stems)",
         description: "Meta AI Hybrid Transformer Demucs 4-stem model (Drums, Bass, Other, Vocals)",
-        stems: &["drums", "bass", "vocals", "other"],
+        stems: &["drums", "bass", "other", "vocals"],
         sdr_score_db: 8.8,
-        download_url: "https://github.com/facebookresearch/demucs/releases/download/v4.0/htdemucs.onnx",
+        download_url: "https://huggingface.co/StemSplitio/htdemucs-onnx/resolve/main/htdemucs.onnx",
         filename: "htdemucs_4s.onnx",
         size_mb: 79.0,
     },
@@ -90,7 +92,7 @@ impl ModelManager {
             .iter()
             .map(|m| {
                 let model_path = dir.join(m.filename);
-                let is_installed = model_path.exists();
+                let is_installed = model_path.exists() && fs::metadata(&model_path).map(|meta| meta.len() > 1_000_000).unwrap_or(false);
                 (m.clone(), is_installed, model_path)
             })
             .collect()
@@ -108,7 +110,7 @@ impl ModelManager {
     pub fn get_installed_model_path(name: &str) -> Option<PathBuf> {
         let model_info = Self::find_model(name)?;
         let path = Self::cache_dir().join(model_info.filename);
-        if path.exists() {
+        if path.exists() && fs::metadata(&path).map(|m| m.len() > 1_000_000).unwrap_or(false) {
             Some(path)
         } else {
             None
@@ -124,7 +126,7 @@ impl ModelManager {
         // Check if custom path was specified in environment variable
         if let Ok(env_path) = std::env::var("TABFORGE_MODEL_PATH") {
             let p = PathBuf::from(env_path);
-            if p.exists() {
+            if p.exists() && fs::metadata(&p).map(|m| m.len() > 1_000_000).unwrap_or(false) {
                 return Some(p);
             }
         }
@@ -138,28 +140,68 @@ impl ModelManager {
             .ok_or_else(|| AudioError::DecodeError(format!("Unknown neural model: '{name}'")))?;
 
         let dest_path = Self::cache_dir().join(model_info.filename);
+        let tmp_path = Self::cache_dir().join(format!("{}.download.tmp", model_info.filename));
 
         if dest_path.exists() {
-            tracing::info!("Model '{}' already present at {}", model_info.display_name, dest_path.display());
-            return Ok(dest_path);
+            if let Ok(meta) = fs::metadata(&dest_path) {
+                if meta.len() > 1_000_000 {
+                    tracing::info!("Model '{}' already present at {}", model_info.display_name, dest_path.display());
+                    return Ok(dest_path);
+                } else {
+                    tracing::warn!("Existing model file is corrupted/too small ({} bytes), redownloading...", meta.len());
+                    let _ = fs::remove_file(&dest_path);
+                }
+            }
         }
 
-        tracing::info!(
-            "Downloading {} (~{:.1} MB) from {} to {}",
-            model_info.display_name,
-            model_info.size_mb,
-            model_info.download_url,
-            dest_path.display()
+        println!("⬇️  Downloading {} (~{:.1} MB)...", model_info.display_name, model_info.size_mb);
+        println!("   Source: {}", model_info.download_url);
+        println!("   Target: {}", dest_path.display());
+
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(600))
+            .redirects(10)
+            .build();
+
+        let response = agent.get(model_info.download_url)
+            .set("User-Agent", "TabForge/0.1.0")
+            .call()
+            .map_err(|e| AudioError::DspError(format!("Failed to connect to model download URL: {}", e)))?;
+
+        let total_size = response
+            .header("content-length")
+            .and_then(|l| l.parse::<u64>().ok())
+            .unwrap_or((model_info.size_mb * 1024.0 * 1024.0) as u64);
+
+        let pb = ProgressBar::new(total_size);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("#>-"),
         );
 
-        // For environments without external network or mock downloads:
-        // We write an initialized model marker or trigger the download
-        let marker_content = format!(
-            "# TabForge Neural Model Header: {}\n# Stems: {:?}\n# SDR: {:.1} dB\n",
-            model_info.display_name, model_info.stems, model_info.sdr_score_db
-        );
+        let mut reader = response.into_reader();
+        let mut file = File::create(&tmp_path)?;
+        let mut buffer = [0u8; 65536];
+        let mut downloaded: u64 = 0;
 
-        fs::write(&dest_path, marker_content)?;
+        loop {
+            let n = reader.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buffer[..n])?;
+            downloaded += n as u64;
+            pb.set_position(downloaded);
+        }
+
+        file.flush()?;
+        drop(file);
+        pb.finish_with_message("Download complete!");
+
+        fs::rename(&tmp_path, &dest_path)?;
+        println!("✅ Model saved successfully to: {}\n", dest_path.display());
 
         Ok(dest_path)
     }

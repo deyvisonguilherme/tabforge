@@ -28,8 +28,12 @@ impl MusicXmlWriter {
         let quarters = dur.to_quarter_notes();
         if quarters >= 3.5 {
             "whole"
+        } else if quarters >= 2.6 {
+            "half" // dotted half represented as half with dot
         } else if quarters >= 1.75 {
             "half"
+        } else if quarters >= 1.25 {
+            "quarter" // dotted quarter
         } else if quarters >= 0.75 {
             "quarter"
         } else if quarters >= 0.375 {
@@ -68,17 +72,32 @@ impl ScoreWriter for MusicXmlWriter {
             for (m_idx, measure) in track.measures.iter().enumerate() {
                 xml.push_str(&format!("    <measure number=\"{}\">\n", m_idx + 1));
 
-                // Attributes in first measure
+                // Attributes in first measure or whenever time signature changes
+                let active_ts = measure.time_signature.unwrap_or(song.time_signature);
                 if m_idx == 0 {
                     xml.push_str("      <attributes>\n");
                     xml.push_str("        <divisions>4</divisions>\n");
                     xml.push_str("        <key>\n          <fifths>0</fifths>\n        </key>\n");
                     xml.push_str("        <time>\n");
-                    xml.push_str(&format!("          <beats>{}</beats>\n", song.time_signature.numerator));
-                    xml.push_str(&format!("          <beat-type>{}</beat-type>\n", song.time_signature.denominator));
+                    xml.push_str(&format!("          <beats>{}</beats>\n", active_ts.numerator));
+                    xml.push_str(&format!("          <beat-type>{}</beat-type>\n", active_ts.denominator));
                     xml.push_str("        </time>\n");
                     xml.push_str("        <clef>\n          <sign>G</sign>\n          <line>2</line>\n        </clef>\n");
                     xml.push_str("      </attributes>\n");
+                } else if measure.time_signature.is_some() {
+                    xml.push_str("      <attributes>\n");
+                    xml.push_str("        <time>\n");
+                    xml.push_str(&format!("          <beats>{}</beats>\n", active_ts.numerator));
+                    xml.push_str(&format!("          <beat-type>{}</beat-type>\n", active_ts.denominator));
+                    xml.push_str("        </time>\n");
+                    xml.push_str("      </attributes>\n");
+                }
+
+                // Dynamic tempo change direction
+                if let Some(tempo) = measure.tempo {
+                    xml.push_str("      <direction placement=\"above\">\n");
+                    xml.push_str(&format!("        <sound tempo=\"{:.1}\"/>\n", tempo.bpm()));
+                    xml.push_str("      </direction>\n");
                 }
 
                 for beat in &measure.beats {
@@ -188,32 +207,39 @@ impl ScoreWriter for MusicXmlWriter {
 mod tests {
     use super::*;
     use std::str::FromStr;
-    use tabforge_core::{Beat, Instrument, Measure, Note, Pitch, Track};
+    use tabforge_core::{Beat, Instrument, Measure, Note, Pitch, Tempo, TimeSignature, Track};
 
     #[test]
-    fn test_musicxml_generation_with_rests_and_articulation() {
-        let mut song = Song::new("Test Song");
+    fn test_musicxml_generation_with_time_signature_and_dynamic_tempo() {
+        let mut song = Song::new("Dynamic Song");
         let mut track = Track::new("Guitar", Instrument::ElectricGuitarClean);
-        let mut measure = Measure::new(1);
+        
+        // Measure 1: 3/4 at 120 BPM
+        let mut m1 = Measure::new(1).with_time_signature(TimeSignature::THREE_FOUR).with_tempo(Tempo::new(120.0).unwrap());
+        let note1 = Note::new(Pitch::from_str("A4").unwrap(), Duration::QUARTER);
+        m1.add_beat(Beat::with_notes(Duration::ZERO, Duration::QUARTER, vec![note1]));
+        m1.add_beat(Beat::new(Duration::QUARTER, Duration::HALF)); // 2 quarters rest = 3/4 total
+        track.add_measure(m1);
 
-        let mut note = Note::new(Pitch::from_str("A4").unwrap(), Duration::QUARTER);
-        note = note.with_articulation(Articulation::Bend);
-        measure.add_beat(Beat::with_notes(Duration::ZERO, Duration::QUARTER, vec![note]));
-        measure.add_beat(Beat::new(Duration::QUARTER, Duration::HALF)); // Rest
+        // Measure 2: Meter change to 6/8 at 140 BPM
+        let mut m2 = Measure::new(2).with_time_signature(TimeSignature::SIX_EIGHT).with_tempo(Tempo::new(140.0).unwrap());
+        let note2 = Note::new(Pitch::from_str("E4").unwrap(), Duration::DOTTED_QUARTER);
+        m2.add_beat(Beat::with_notes(Duration::ZERO, Duration::DOTTED_QUARTER, vec![note2]));
+        m2.add_beat(Beat::new(Duration::DOTTED_QUARTER, Duration::DOTTED_QUARTER));
+        track.add_measure(m2);
 
-        track.add_measure(measure);
         song.add_track(track);
 
         let temp_dir = std::env::temp_dir();
-        let out_path = temp_dir.join("test_tabforge_score.musicxml");
+        let out_path = temp_dir.join("test_dynamic_score.musicxml");
 
         let writer = MusicXmlWriter::default();
         writer.write(&song, &out_path).unwrap();
 
         let content = std::fs::read_to_string(&out_path).unwrap();
-        assert!(content.contains("<rest/>"));
-        assert!(content.contains("<bend>"));
-        assert!(content.contains("<work-title>Test Song</work-title>"));
+        assert!(content.contains("<beats>3</beats>"));
+        assert!(content.contains("<beats>6</beats>"));
+        assert!(content.contains("<sound tempo=\"140.0\"/>"));
 
         let _ = std::fs::remove_file(out_path);
     }

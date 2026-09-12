@@ -17,11 +17,15 @@ fn main() -> Result<()> {
         _ => "trace",
     };
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter_level)),
-        )
-        .init();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        if args.verbose < 2 {
+            EnvFilter::new(format!("{filter_level},ort=warn"))
+        } else {
+            EnvFilter::new(filter_level)
+        }
+    });
+
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let _config = config::Config::load_or_default(args.config.as_deref());
 
@@ -34,7 +38,15 @@ fn main() -> Result<()> {
             output,
             separate,
             stem,
-        } => commands::transcribe::execute(input, instrument, output.as_deref(), *separate, stem)?,
+            time_signature,
+        } => commands::transcribe::execute(
+            input,
+            instrument,
+            output.as_deref(),
+            *separate,
+            stem,
+            time_signature.as_deref(),
+        )?,
         Commands::Stems {
             input,
             output_dir,

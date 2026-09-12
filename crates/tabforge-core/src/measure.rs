@@ -1,5 +1,6 @@
 use crate::beat::Beat;
-use crate::tempo::TimeSignature;
+use crate::duration::Duration;
+use crate::tempo::{Tempo, TimeSignature};
 use serde::{Deserialize, Serialize};
 
 /// A single musical measure (compasso)
@@ -7,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub struct Measure {
     pub number: u32,
     pub time_signature: Option<TimeSignature>,
+    pub tempo: Option<Tempo>,
     pub beats: Vec<Beat>,
 }
 
@@ -15,11 +17,27 @@ impl Measure {
         Self {
             number,
             time_signature: None,
+            tempo: None,
             beats: Vec::new(),
         }
     }
 
+    pub fn with_time_signature(mut self, time_signature: TimeSignature) -> Self {
+        self.time_signature = Some(time_signature);
+        self
+    }
+
+    pub fn with_tempo(mut self, tempo: Tempo) -> Self {
+        self.tempo = Some(tempo);
+        self
+    }
+
     pub fn add_beat(&mut self, beat: Beat) {
         self.beats.push(beat);
+    }
+
+    /// Calculate total filled duration of beats in this measure
+    pub fn total_duration(&self) -> Duration {
+        self.beats.iter().map(|b| b.duration).fold(Duration::ZERO, |acc, d| acc + d)
     }
 }

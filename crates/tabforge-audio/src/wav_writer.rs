@@ -6,7 +6,8 @@ use std::path::Path;
 
 /// Write AudioBuffer to standard 16-bit PCM WAV file
 pub fn write_wav(buffer: &AudioBuffer, path: &Path) -> Result<()> {
-    let mut file = File::create(path)?;
+    let raw_file = File::create(path)?;
+    let mut file = std::io::BufWriter::with_capacity(128 * 1024, raw_file);
 
     let num_channels = buffer.channels;
     let sample_rate = buffer.sample_rate;

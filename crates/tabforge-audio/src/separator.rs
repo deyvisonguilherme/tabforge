@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::f32::consts::PI;
 use std::path::{Path, PathBuf};
 
-/// Source separated stems for audio tracks (e.g. Guitar, Bass, Drums, Vocals, Other)
+/// Source separated stems for audio tracks (e.g. Guitar, Bass, Drums, Vocals, Piano, Other)
 #[derive(Debug, Clone)]
 pub struct SeparatedTracks {
     pub stems: HashMap<String, AudioBuffer>,
@@ -58,14 +58,16 @@ impl SourceSeparator for PassthroughSeparator {
     }
 }
 
-/// Harmonic-Percussive Source Separation (HPSS) with 2D Median Filtering and Spectral Sub-band Masking
+/// Enhanced Harmonic-Percussive Source Separation (HPSS) with 2D Median Filtering,
+/// Spectral Gating, and Noise Floor Attenuation
 #[derive(Debug, Clone)]
 pub struct HarmonicPercussiveSeparator {
     pub window_size: usize,
     pub hop_size: usize,
-    pub harmonic_kernel_size: usize,   // Horizontal median across time
-    pub percussive_kernel_size: usize, // Vertical median across frequency
-    pub power: f32,                    // Mask power (default 2.0)
+    pub harmonic_kernel_size: usize,   // Horizontal median across time (default 31)
+    pub percussive_kernel_size: usize, // Vertical median across frequency (default 31)
+    pub power: f32,                    // Mask exponent (default 2.5 for sharper separation)
+    pub noise_floor_ratio: f32,        // Spectral noise gate threshold (default 0.015)
 }
 
 impl Default for HarmonicPercussiveSeparator {
@@ -73,9 +75,10 @@ impl Default for HarmonicPercussiveSeparator {
         Self {
             window_size: 2048,
             hop_size: 512,
-            harmonic_kernel_size: 17,
-            percussive_kernel_size: 17,
-            power: 2.0,
+            harmonic_kernel_size: 31,
+            percussive_kernel_size: 31,
+            power: 2.5,
+            noise_floor_ratio: 0.015,
         }
     }
 }
@@ -112,6 +115,7 @@ impl SourceSeparator for HarmonicPercussiveSeparator {
         let num_frames = (samples.len() - n) / hop + 1;
         let mut stft_frames = Vec::with_capacity(num_frames);
         let mut mag_spectrogram = Vec::with_capacity(num_frames);
+        let mut max_global_mag = 0.0f32;
 
         for i in 0..num_frames {
             let start = i * hop;
@@ -125,43 +129,59 @@ impl SourceSeparator for HarmonicPercussiveSeparator {
 
             let mut frame_mag = Vec::with_capacity(half_w);
             for k in 0..half_w {
-                frame_mag.push((fft_buf[k].re * fft_buf[k].re + fft_buf[k].im * fft_buf[k].im).sqrt());
+                let mag = (fft_buf[k].re * fft_buf[k].re + fft_buf[k].im * fft_buf[k].im).sqrt();
+                if mag > max_global_mag {
+                    max_global_mag = mag;
+                }
+                frame_mag.push(mag);
             }
 
             stft_frames.push(fft_buf);
             mag_spectrogram.push(frame_mag);
         }
 
-        // 3. 2D Median Filtering
-        // Harmonic: horizontal median across time for each frequency bin
-        let half_h = self.harmonic_kernel_size / 2;
+        let noise_gate = max_global_mag * self.noise_floor_ratio;
+
+        // 3. Fast 2D Median Filtering (Zero Heap Allocation)
+        let half_h = (self.harmonic_kernel_size / 2).min(31);
         let mut harm_mag = vec![vec![0.0f32; half_w]; num_frames];
 
         for k in 0..half_w {
             for t in 0..num_frames {
                 let start_t = t.saturating_sub(half_h);
                 let end_t = (t + half_h + 1).min(num_frames);
-                let mut window_vals: Vec<f32> = (start_t..end_t).map(|idx| mag_spectrogram[idx][k]).collect();
-                window_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                harm_mag[t][k] = window_vals[window_vals.len() / 2];
+                let count = end_t - start_t;
+                let mut buf = [0.0f32; 64];
+                for (idx, slot) in (start_t..end_t).zip(buf.iter_mut()) {
+                    *slot = mag_spectrogram[idx][k];
+                }
+                let slice = &mut buf[..count];
+                let mid = count / 2;
+                slice.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                harm_mag[t][k] = slice[mid];
             }
         }
 
-        // Percussive: vertical median across frequency for each time frame
-        let half_p = self.percussive_kernel_size / 2;
+        let half_p = (self.percussive_kernel_size / 2).min(31);
         let mut perc_mag = vec![vec![0.0f32; half_w]; num_frames];
 
         for t in 0..num_frames {
             for k in 0..half_w {
                 let start_k = k.saturating_sub(half_p);
                 let end_k = (k + half_p + 1).min(half_w);
-                let mut window_vals: Vec<f32> = (start_k..end_k).map(|idx| mag_spectrogram[t][idx]).collect();
-                window_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                perc_mag[t][k] = window_vals[window_vals.len() / 2];
+                let count = end_k - start_k;
+                let mut buf = [0.0f32; 64];
+                for (idx, slot) in (start_k..end_k).zip(buf.iter_mut()) {
+                    *slot = mag_spectrogram[t][idx];
+                }
+                let slice = &mut buf[..count];
+                let mid = count / 2;
+                slice.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                perc_mag[t][k] = slice[mid];
             }
         }
 
-        // 4. Soft Masking and Multi-Stem Synthesis via iSTFT
+        // 4. Soft Masking with Wiener-style Power Exponent and Sub-Band Spectral Filtering
         let total_samples = (num_frames - 1) * hop + n;
         let bin_hz = sample_rate as f32 / n as f32;
 
@@ -182,6 +202,12 @@ impl SourceSeparator for HarmonicPercussiveSeparator {
             let mut other_spec = vec![Complex::new(0.0, 0.0); n];
 
             for k in 0..half_w {
+                let orig_mag = mag_spectrogram[t][k];
+                if orig_mag < noise_gate {
+                    // Suppress noise floor
+                    continue;
+                }
+
                 let h_val = harm_mag[t][k].powf(self.power);
                 let p_val = perc_mag[t][k].powf(self.power);
                 let sum_val = (h_val + p_val).max(1e-8);
@@ -192,44 +218,79 @@ impl SourceSeparator for HarmonicPercussiveSeparator {
                 let orig_c = stft_frames[t][k];
                 let freq = k as f32 * bin_hz;
 
-                // Drums get full percussive energy
-                let c_drums = orig_c * mask_p;
+                // Suppress vocal formants/consonants bleeding into drums:
+                // When sustained harmonic energy exists in the vocal formant band (200 - 4500 Hz),
+                // transient energy belongs to singing articulation rather than drum hits.
+                let vocal_harmonic_ratio = harm_mag[t][k] / (perc_mag[t][k] + 1e-6);
+                let vocal_bleed_suppression = if freq >= 180.0 && freq <= 4500.0 && vocal_harmonic_ratio > 0.30 {
+                    (0.30 / vocal_harmonic_ratio).min(1.0).powi(2)
+                } else {
+                    1.0
+                };
+
+                // 1. Drums stem: Percussive mask + frequency band shaping + vocal bleed reduction
+                let drum_band_gain = if freq < 120.0 {
+                    1.0 // Kick drum
+                } else if freq <= 4500.0 {
+                    0.85 * vocal_bleed_suppression // Snare, Toms with vocal sibilance suppression
+                } else if freq <= 9000.0 {
+                    0.70 // Hi-hats, Cymbals
+                } else {
+                    0.30 // Cut ultra-high vocal sibilance bleed
+                };
+                let c_drums = orig_c * (mask_p * drum_band_gain);
                 drums_spec[k] = c_drums;
                 if k > 0 && k < n / 2 {
                     drums_spec[n - k] = c_drums.conj();
                 }
 
-                // Harmonic component sub-band routing
+                // 2. Harmonic components routing
                 let c_harm = orig_c * mask_h;
 
-                // Bass: low harmonic (< 260 Hz)
-                let bass_gain = if freq < 260.0 { 1.0 } else { (1.0 - (freq - 260.0) / 100.0).clamp(0.0, 1.0) };
+                // Bass stem: Low harmonic (< 260 Hz) with steep roll-off
+                let bass_gain = if freq < 240.0 {
+                    1.0
+                } else if freq < 360.0 {
+                    (1.0 - (freq - 240.0) / 120.0).max(0.0)
+                } else {
+                    0.0
+                };
                 let c_bass = c_harm * bass_gain;
                 bass_spec[k] = c_bass;
                 if k > 0 && k < n / 2 {
                     bass_spec[n - k] = c_bass.conj();
                 }
 
-                // Guitar: mid-band guitar range (80 Hz to 4200 Hz)
-                let guitar_gain = if freq >= 80.0 && freq <= 4200.0 { 1.0 } else { 0.2 };
+                // Guitar stem: 80 Hz to 4500 Hz (rejects sub-bass rumble and high air hiss)
+                let guitar_gain = if freq >= 80.0 && freq <= 4200.0 {
+                    if freq < 180.0 {
+                        0.7 // Avoid bass overlap
+                    } else {
+                        1.0
+                    }
+                } else if freq < 80.0 {
+                    0.0
+                } else {
+                    0.15
+                };
                 let c_guitar = c_harm * guitar_gain;
                 guitar_spec[k] = c_guitar;
                 if k > 0 && k < n / 2 {
                     guitar_spec[n - k] = c_guitar.conj();
                 }
 
-                // Vocals: speech/vocal presence range (200 Hz to 7500 Hz)
-                let vocal_gain = if freq >= 200.0 && freq <= 7500.0 { 1.0 } else { 0.1 };
+                // Vocals stem: 200 Hz to 7500 Hz
+                let vocal_gain = if freq >= 200.0 && freq <= 7000.0 { 1.0 } else { 0.05 };
                 let c_vocals = c_harm * vocal_gain;
                 vocals_spec[k] = c_vocals;
                 if k > 0 && k < n / 2 {
                     vocals_spec[n - k] = c_vocals.conj();
                 }
 
-                // Other: remaining harmonic
-                other_spec[k] = c_harm;
+                // Other stem: Remaining harmonic energy
+                other_spec[k] = c_harm * 0.8;
                 if k > 0 && k < n / 2 {
-                    other_spec[n - k] = c_harm.conj();
+                    other_spec[n - k] = (c_harm * 0.8).conj();
                 }
             }
 
@@ -279,7 +340,7 @@ impl SourceSeparator for HarmonicPercussiveSeparator {
     }
 }
 
-/// Neural Network / ONNX Runtime Source Separator with chunked memory management and DSP HPSS fallback
+/// Neural Network / ONNX Runtime Source Separator with sliding window chunking and crossfades
 pub struct NeuralSourceSeparator {
     pub model_path: Option<PathBuf>,
     pub fallback_separator: HarmonicPercussiveSeparator,
@@ -292,8 +353,8 @@ impl NeuralSourceSeparator {
         Self {
             model_path: None,
             fallback_separator: HarmonicPercussiveSeparator::default(),
-            chunk_duration_secs: 6.0,
-            overlap_duration_secs: 1.5,
+            chunk_duration_secs: 8.0,
+            overlap_duration_secs: 2.0,
         }
     }
 
@@ -308,88 +369,150 @@ impl NeuralSourceSeparator {
         self
     }
 
-    /// Process a single chunk of audio through neural model or HPSS fallback
-    fn process_single_chunk(&self, chunk_audio: &AudioBuffer) -> Result<SeparatedTracks> {
-        self.fallback_separator.separate(chunk_audio)
-    }
-}
-
-impl Default for NeuralSourceSeparator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl SourceSeparator for NeuralSourceSeparator {
-    fn separate(&self, audio: &AudioBuffer) -> Result<SeparatedTracks> {
-        if let Some(ref path) = self.model_path {
-            if path.exists() {
-                tracing::info!("Executing neural source separation with model: {}", path.display());
-            } else {
-                tracing::warn!("Model file not found at: {}, using DSP HPSS fallback", path.display());
+    /// Try loading an ONNX Runtime session from the model path
+    fn load_onnx_session(&self, path: &Path) -> Option<(ort::session::Session, Vec<String>)> {
+        if !path.exists() {
+            return None;
+        }
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() < 1_000_000 {
+                tracing::warn!("Model file at {} is smaller than 1MB (likely a placeholder marker), falling back to DSP", path.display());
+                return None;
             }
+        }
+
+        tracing::info!("Initializing ONNX Runtime session for model: {}", path.display());
+        let session = match ort::session::Session::builder()
+            .and_then(|mut b| {
+                b = b.with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?;
+                b.commit_from_file(path)
+            })
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("Failed to create ONNX session from {}: {}. Falling back to DSP.", path.display(), e);
+                return None;
+            }
+        };
+
+        // Determine stem mapping based on filename / model characteristics
+        let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+        let stems = if filename.contains("6s") {
+            vec![
+                "drums".to_string(),
+                "bass".to_string(),
+                "other".to_string(),
+                "vocals".to_string(),
+                "guitar".to_string(),
+                "piano".to_string(),
+            ]
+        } else if filename.contains("roformer") {
+            vec!["vocals".to_string(), "other".to_string()]
         } else {
-            tracing::info!("Using DSP HPSS source separator");
-        }
+            vec![
+                "drums".to_string(),
+                "bass".to_string(),
+                "other".to_string(),
+                "vocals".to_string(),
+            ]
+        };
 
+        Some((session, stems))
+    }
+
+    /// Process audio using loaded ONNX Runtime model
+    fn separate_neural(
+        &self,
+        session: &mut ort::session::Session,
+        stem_names: &[String],
+        audio: &AudioBuffer,
+    ) -> Result<SeparatedTracks> {
+        let sample_rate = audio.sample_rate;
         let mono = audio.to_mono();
-        let sample_rate = mono.sample_rate;
         let total_samples = mono.samples.len();
-        let duration = mono.duration_seconds();
 
-        // If audio fits in a single chunk, process directly
-        if duration <= self.chunk_duration_secs || self.chunk_duration_secs <= 0.0 {
-            return self.process_single_chunk(&mono);
-        }
-
-        // Sliding window chunking with smooth crossfade
-        let chunk_samples = (self.chunk_duration_secs * sample_rate as f64).round() as usize;
-        let overlap_samples = (self.overlap_duration_secs * sample_rate as f64).round() as usize;
-        let hop_samples = (chunk_samples.saturating_sub(overlap_samples)).max(1);
+        // HTDemucs v4 ONNX models are compiled with a fixed chunk size of 343980 samples (~7.8s at 44.1 kHz)
+        let chunk_samples = 343980usize;
+        let overlap_samples = chunk_samples / 4; // 25% overlap (85995 samples ~ 1.95s)
+        let hop_samples = chunk_samples - overlap_samples;
 
         let mut output_stems: HashMap<String, Vec<f32>> = HashMap::new();
+        for stem in stem_names {
+            output_stems.insert(stem.clone(), vec![0.0f32; total_samples]);
+        }
         let mut stem_weights = vec![0.0f32; total_samples];
 
         let mut start_idx = 0;
+        let num_stems = stem_names.len();
+
         while start_idx < total_samples {
             let end_idx = (start_idx + chunk_samples).min(total_samples);
-            let chunk_slice = mono.samples[start_idx..end_idx].to_vec();
-            let current_chunk_len = chunk_slice.len();
+            let current_len = end_idx - start_idx;
 
-            let chunk_buf = AudioBuffer::new(chunk_slice, sample_rate, 1);
-            let separated_chunk = self.process_single_chunk(&chunk_buf)?;
+            // Prepare stereo input tensor [1, 2, chunk_samples] with zero-padding if at end
+            let mut input_data = vec![0.0f32; 2 * chunk_samples];
+            for j in 0..current_len {
+                let s = mono.samples[start_idx + j];
+                input_data[j] = s;
+                input_data[chunk_samples + j] = s;
+            }
 
-            // Build crossfade envelope for this chunk
-            let mut crossfade = vec![1.0f32; current_chunk_len];
-            let fade_len = overlap_samples.min(current_chunk_len / 3);
+            let input_tensor = ort::value::Tensor::from_array(([1usize, 2, chunk_samples], input_data))
+                .map_err(|e| crate::error::AudioError::DspError(format!("Failed to create ONNX input tensor: {e}")))?;
 
+            let outputs = session
+                .run(ort::inputs![input_tensor])
+                .map_err(|e| crate::error::AudioError::DspError(format!("ONNX model execution failed: {e}")))?;
+
+            let first_output = outputs
+                .into_iter()
+                .next()
+                .ok_or_else(|| crate::error::AudioError::DspError("ONNX model produced empty output".to_string()))?;
+
+            let (extracted_shape, extracted_data) = first_output.1
+                .try_extract_tensor::<f32>()
+                .map_err(|e| crate::error::AudioError::DspError(format!("Failed to extract output tensor: {e}")))?;
+
+            // Build crossfade window
+            let mut crossfade = vec![1.0f32; current_len];
+            let fade_len = overlap_samples.min(current_len / 3);
             if start_idx > 0 && fade_len > 0 {
-                // Fade in
                 for j in 0..fade_len {
                     crossfade[j] = 0.5 * (1.0 - (PI * j as f32 / fade_len as f32).cos());
                 }
             }
-
             if end_idx < total_samples && fade_len > 0 {
-                // Fade out
                 for j in 0..fade_len {
-                    let idx = current_chunk_len - fade_len + j;
+                    let idx = current_len - fade_len + j;
                     crossfade[idx] = 0.5 * (1.0 + (PI * j as f32 / fade_len as f32).cos());
                 }
             }
 
-            for (stem_name, stem_buffer) in separated_chunk.stems {
-                let stem_accum = output_stems
-                    .entry(stem_name)
-                    .or_insert_with(|| vec![0.0f32; total_samples]);
+            let is_4d = extracted_shape.len() == 4;
+            let channels_per_stem = if is_4d { extracted_shape[2] as usize } else { 1 };
+            let samples_per_stem = if is_4d { extracted_shape[3] as usize } else { extracted_shape[2] as usize };
 
-                let len_to_copy = current_chunk_len.min(stem_buffer.samples.len());
-                for j in 0..len_to_copy {
-                    stem_accum[start_idx + j] += stem_buffer.samples[j] * crossfade[j];
+            for (stem_idx, stem_name) in stem_names.iter().enumerate() {
+                if stem_idx >= num_stems {
+                    break;
+                }
+                if let Some(target_acc) = output_stems.get_mut(stem_name) {
+                    let stem_offset = stem_idx * channels_per_stem * samples_per_stem;
+                    for j in 0..current_len.min(samples_per_stem) {
+                        let mut sample_val = 0.0f32;
+                        for ch in 0..channels_per_stem {
+                            let idx = stem_offset + ch * samples_per_stem + j;
+                            if idx < extracted_data.len() {
+                                sample_val += extracted_data[idx];
+                            }
+                        }
+                        sample_val /= channels_per_stem as f32;
+                        target_acc[start_idx + j] += sample_val * crossfade[j];
+                    }
                 }
             }
 
-            for j in 0..current_chunk_len {
+            for j in 0..current_len {
                 stem_weights[start_idx + j] += crossfade[j];
             }
 
@@ -399,7 +522,7 @@ impl SourceSeparator for NeuralSourceSeparator {
             start_idx += hop_samples;
         }
 
-        // Normalize accumulated stems by overlap weights
+        // Normalize weights and return SeparatedTracks
         let mut final_tracks = SeparatedTracks::new();
         for (stem_name, mut stem_data) in output_stems {
             for i in 0..total_samples {
@@ -412,6 +535,31 @@ impl SourceSeparator for NeuralSourceSeparator {
         }
 
         Ok(final_tracks)
+    }
+}
+
+impl Default for NeuralSourceSeparator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SourceSeparator for NeuralSourceSeparator {
+    fn separate(&self, audio: &AudioBuffer) -> Result<SeparatedTracks> {
+        if let Some(ref path) = self.model_path {
+            if let Some((mut session, stems)) = self.load_onnx_session(path) {
+                tracing::info!("Running neural ONNX inference with {} stems: {:?}", stems.len(), stems);
+                match self.separate_neural(&mut session, &stems, audio) {
+                    Ok(tracks) => return Ok(tracks),
+                    Err(e) => {
+                        tracing::warn!("Neural inference error: {}. Falling back to DSP HPSS.", e);
+                    }
+                }
+            }
+        }
+
+        tracing::info!("Executing DSP HPSS source separation engine (fallback)");
+        self.fallback_separator.separate(audio)
     }
 }
 

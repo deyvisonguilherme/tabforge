@@ -23,5 +23,5 @@ pub use measure::Measure;
 pub use note::{Articulation, Note};
 pub use pitch::{NoteName, Pitch};
 pub use song::Song;
-pub use tempo::{Tempo, TimeSignature};
+pub use tempo::{Tempo, TempoChange, TimeSignature, TimeSignatureChange};
 pub use track::Track;

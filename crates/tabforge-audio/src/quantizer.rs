@@ -1,8 +1,9 @@
 use crate::error::Result;
 use crate::traits::{BeatGrid, OnsetEvent, PitchEvent, Quantizer, RawNoteEvent};
-use tabforge_core::{Beat, Duration, Measure, Note, Pitch};
+use tabforge_core::{Beat, Duration, Measure, Note, Pitch, Tempo, TimeSignature};
 
-/// Rhythmic quantizer converting continuous event timestamps into exact rational Beats and Measures
+/// Rhythmic quantizer converting continuous event timestamps into exact rational Beats and Measures,
+/// supporting flexible time signatures (4/4, 3/4, 6/8, 7/8, etc.) and dynamic tempo changes.
 pub struct SimpleQuantizer {
     pub min_subdivision: Duration,
 }
@@ -31,12 +32,16 @@ impl Quantizer for SimpleQuantizer {
 }
 
 impl SimpleQuantizer {
-    /// Approximate continuous duration in quarter-notes to the nearest canonical musical duration
+    /// Approximate continuous duration in quarter-notes to canonical musical duration
     pub fn approximate_duration(&self, quarters: f64) -> Duration {
         if quarters >= 3.5 {
             Duration::WHOLE
+        } else if quarters >= 2.6 {
+            Duration::DOTTED_HALF
         } else if quarters >= 1.75 {
             Duration::HALF
+        } else if quarters >= 1.25 {
+            Duration::DOTTED_QUARTER
         } else if quarters >= 0.75 {
             Duration::QUARTER
         } else if quarters >= 0.375 {
@@ -46,18 +51,22 @@ impl SimpleQuantizer {
         }
     }
 
-    /// Decompose a gap duration into a sequence of canonical rest durations
+    /// Decompose a gap duration into canonical musical rest durations (including dotted rests)
     pub fn decompose_rest_duration(mut gap: Duration) -> Vec<Duration> {
         let mut rests = Vec::new();
         let denominations = [
-            Duration::WHOLE,
-            Duration::HALF,
-            Duration::QUARTER,
-            Duration::EIGHTH,
-            Duration::SIXTEENTH,
+            Duration::WHOLE,          // 1/1
+            Duration::DOTTED_HALF,    // 3/4
+            Duration::HALF,           // 1/2
+            Duration::DOTTED_QUARTER, // 3/8 (canonical 6/8 compound rest)
+            Duration::QUARTER,        // 1/4
+            Duration::DOTTED_EIGHTH,  // 3/16
+            Duration::EIGHTH,         // 1/8
+            Duration::SIXTEENTH,      // 1/16
+            Duration::THIRTY_SECOND,  // 1/32
         ];
 
-        while gap >= Duration::SIXTEENTH {
+        while gap >= Duration::THIRTY_SECOND {
             let mut fitted = false;
             for &denom in &denominations {
                 if gap >= denom {
@@ -75,33 +84,41 @@ impl SimpleQuantizer {
         rests
     }
 
-    /// Quantize raw note events into perfectly formatted 4/4 musical measures with rest filling
+    /// Quantize raw note events into structured musical measures supporting flexible time signatures and dynamic tempo
     pub fn quantize_to_measures(
         &self,
         raw_events: &[RawNoteEvent],
         beat_grid: &BeatGrid,
     ) -> Result<Vec<Measure>> {
+        let default_time_sig = beat_grid.time_signature;
+        let default_capacity = default_time_sig.measure_duration();
+
         if raw_events.is_empty() {
-            let mut empty_measure = Measure::new(1);
-            empty_measure.add_beat(Beat::new(Duration::ZERO, Duration::WHOLE));
+            let mut empty_measure = Measure::new(1).with_time_signature(default_time_sig).with_tempo(beat_grid.tempo);
+            let rest_pieces = Self::decompose_rest_duration(default_capacity);
+            let mut pos = Duration::ZERO;
+            for piece in rest_pieces {
+                empty_measure.add_beat(Beat::new(pos, piece));
+                pos += piece;
+            }
             return Ok(vec![empty_measure]);
         }
-
-        let quarter_secs = beat_grid.tempo.quarter_note_seconds();
-        let measure_capacity = Duration::WHOLE; // 4/4 = 1 Whole Note (4 Quarters)
 
         // 1. Sort raw events by start time
         let mut sorted_events = raw_events.to_vec();
         sorted_events.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap_or(std::cmp::Ordering::Equal));
 
-        let mut timeline_beats: Vec<(Duration, Duration, Vec<Note>)> = Vec::new();
+        let mut timeline_beats: Vec<(Duration, Duration, f64, Vec<Note>)> = Vec::new();
         let mut current_timeline = Duration::ZERO;
 
         for event in sorted_events {
+            let effective_tempo = beat_grid.tempo_at(event.start_time);
+            let quarter_secs = effective_tempo.quarter_note_seconds();
+
             let q_start = (event.start_time / quarter_secs).max(0.0);
             let q_dur = ((event.end_time - event.start_time).max(quarter_secs * 0.25)) / quarter_secs;
 
-            // Quantize start position to 16th grid (fraction of whole note)
+            // Quantize start position to 16th grid (fraction of whole note: quarter / 4)
             let raw_16th = (q_start * 4.0).round() as i32;
             let note_start = Duration::new(raw_16th, 16);
             let note_dur = self.approximate_duration(q_dur);
@@ -112,7 +129,7 @@ impl SimpleQuantizer {
                 let rest_pieces = Self::decompose_rest_duration(gap);
                 let mut rest_pos = current_timeline;
                 for piece in rest_pieces {
-                    timeline_beats.push((rest_pos, piece, Vec::new()));
+                    timeline_beats.push((rest_pos, piece, event.start_time, Vec::new()));
                     rest_pos += piece;
                 }
                 current_timeline = note_start;
@@ -122,16 +139,35 @@ impl SimpleQuantizer {
             if let Some(art) = event.articulation {
                 note = note.with_articulation(art);
             }
-            timeline_beats.push((current_timeline, note_dur, vec![note]));
+            timeline_beats.push((current_timeline, note_dur, event.start_time, vec![note]));
             current_timeline += note_dur;
         }
 
-        // 2. Partition global timeline beats into Measures of 4/4
+        // 2. Partition global timeline beats into flexible Measures
         let mut measures: Vec<Measure> = Vec::new();
-        let mut current_measure = Measure::new(1);
+        let mut current_measure_num = 1;
+        let mut current_measure = Measure::new(current_measure_num);
         let mut measure_filled = Duration::ZERO;
+        let mut last_time_sig: Option<TimeSignature> = None;
+        let mut last_tempo: Option<Tempo> = None;
 
-        for (_pos, dur, notes) in timeline_beats {
+        for (_pos, dur, start_time_secs, notes) in timeline_beats {
+            let active_time_sig = beat_grid.time_signature_at(start_time_secs);
+            let active_tempo = beat_grid.tempo_at(start_time_secs);
+            let measure_capacity = active_time_sig.measure_duration();
+
+            // Check if measure needs header attributes
+            if measure_filled == Duration::ZERO {
+                if last_time_sig != Some(active_time_sig) {
+                    current_measure.time_signature = Some(active_time_sig);
+                    last_time_sig = Some(active_time_sig);
+                }
+                if last_tempo != Some(active_tempo) {
+                    current_measure.tempo = Some(active_tempo);
+                    last_tempo = Some(active_tempo);
+                }
+            }
+
             let mut remaining_dur = dur;
             let current_notes = notes;
 
@@ -161,14 +197,17 @@ impl SimpleQuantizer {
 
                 if measure_filled >= measure_capacity {
                     measures.push(current_measure);
-                    let next_num = measures.len() as u32 + 1;
-                    current_measure = Measure::new(next_num);
+                    current_measure_num += 1;
+                    current_measure = Measure::new(current_measure_num);
                     measure_filled = Duration::ZERO;
                 }
             }
         }
 
         // Fill trailing rest in last measure if partially filled
+        let active_time_sig = beat_grid.time_signature;
+        let measure_capacity = active_time_sig.measure_duration();
+
         if measure_filled > Duration::ZERO && measure_filled < measure_capacity {
             let trailing_gap = measure_capacity - measure_filled;
             let rest_pieces = Self::decompose_rest_duration(trailing_gap);
@@ -178,7 +217,7 @@ impl SimpleQuantizer {
             }
             measures.push(current_measure);
         } else if measure_filled == Duration::ZERO && !measures.is_empty() {
-            // Already clean
+            // Already cleanly closed
         } else if measures.is_empty() {
             measures.push(current_measure);
         }
@@ -282,17 +321,16 @@ pub fn segment_notes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tabforge_core::{Pitch, Tempo};
+    use tabforge_core::{Pitch, Tempo, TimeSignature};
 
     #[test]
-    fn test_quantize_to_measures_with_rest_filling() {
+    fn test_quantize_to_measures_4_4() {
         let quantizer = SimpleQuantizer::default();
-        let beat_grid = BeatGrid {
-            tempo: Tempo::new(120.0).unwrap(), // 1 quarter = 0.5s
-            beat_times_seconds: vec![0.0, 0.5, 1.0, 1.5, 2.0],
-        };
+        let beat_grid = BeatGrid::new(
+            Tempo::new(120.0).unwrap(), // 1 quarter = 0.5s
+            vec![0.0, 0.5, 1.0, 1.5, 2.0],
+        );
 
-        // Two quarter notes at 0.0s and 1.0s (leaving 0.5s rest in between, and rest at end of 4/4 measure)
         let raw_events = vec![
             RawNoteEvent {
                 start_time: 0.0,
@@ -314,11 +352,7 @@ mod tests {
         assert_eq!(measures.len(), 1);
         let m = &measures[0];
 
-        // Total duration of beats in the measure must equal Duration::WHOLE (1/1)
-        let total_measure_dur: Duration = m.beats.iter().map(|b| b.duration).fold(Duration::ZERO, |acc, d| acc + d);
-        assert_eq!(total_measure_dur, Duration::WHOLE, "Measure total duration must be exactly 1 whole note (4/4)");
-
-        // Verify notes and rests sequence: Note, Rest, Note, Rest
+        assert_eq!(m.total_duration(), Duration::WHOLE);
         assert_eq!(m.beats.len(), 4);
         assert!(!m.beats[0].is_rest());
         assert_eq!(m.beats[0].notes[0].pitch, Pitch::E2);
@@ -327,5 +361,86 @@ mod tests {
         assert_eq!(m.beats[2].notes[0].pitch, Pitch::A2);
         assert_eq!(m.beats[2].notes[0].articulation, Some(tabforge_core::Articulation::HammerOn));
         assert!(m.beats[3].is_rest());
+    }
+
+    #[test]
+    fn test_quantize_to_measures_3_4_waltz() {
+        let quantizer = SimpleQuantizer::default();
+        let mut beat_grid = BeatGrid::new(
+            Tempo::new(120.0).unwrap(),
+            vec![0.0, 0.5, 1.0, 1.5],
+        );
+        beat_grid.time_signature = TimeSignature::THREE_FOUR;
+
+        let raw_events = vec![
+            RawNoteEvent {
+                start_time: 0.0,
+                end_time: 0.5,
+                pitch: Pitch::E2,
+                velocity: 90,
+                articulation: None,
+            },
+        ];
+
+        let measures = quantizer.quantize_to_measures(&raw_events, &beat_grid).unwrap();
+        assert_eq!(measures.len(), 1);
+        let m = &measures[0];
+
+        assert_eq!(m.total_duration(), Duration::new(3, 4), "3/4 measure must equal 3/4 duration");
+        assert_eq!(m.time_signature, Some(TimeSignature::THREE_FOUR));
+    }
+
+    #[test]
+    fn test_quantize_to_measures_6_8_compound() {
+        let quantizer = SimpleQuantizer::default();
+        let mut beat_grid = BeatGrid::new(
+            Tempo::new(120.0).unwrap(),
+            vec![0.0, 0.5, 1.0],
+        );
+        beat_grid.time_signature = TimeSignature::SIX_EIGHT;
+
+        let raw_events = vec![
+            RawNoteEvent {
+                start_time: 0.0,
+                end_time: 0.5,
+                pitch: Pitch::D3,
+                velocity: 90,
+                articulation: None,
+            },
+        ];
+
+        let measures = quantizer.quantize_to_measures(&raw_events, &beat_grid).unwrap();
+        assert_eq!(measures.len(), 1);
+        let m = &measures[0];
+
+        assert_eq!(m.total_duration(), Duration::new(6, 8), "6/8 measure capacity must equal 6/8 duration");
+        assert_eq!(m.time_signature, Some(TimeSignature::SIX_EIGHT));
+    }
+
+    #[test]
+    fn test_quantize_to_measures_7_8_odd_meter() {
+        let quantizer = SimpleQuantizer::default();
+        let mut beat_grid = BeatGrid::new(
+            Tempo::new(120.0).unwrap(),
+            vec![0.0, 0.5, 1.0],
+        );
+        beat_grid.time_signature = TimeSignature::SEVEN_EIGHT;
+
+        let raw_events = vec![
+            RawNoteEvent {
+                start_time: 0.0,
+                end_time: 0.5,
+                pitch: Pitch::G3,
+                velocity: 95,
+                articulation: None,
+            },
+        ];
+
+        let measures = quantizer.quantize_to_measures(&raw_events, &beat_grid).unwrap();
+        assert_eq!(measures.len(), 1);
+        let m = &measures[0];
+
+        assert_eq!(m.total_duration(), Duration::new(7, 8), "7/8 measure capacity must equal 7/8 duration");
+        assert_eq!(m.time_signature, Some(TimeSignature::SEVEN_EIGHT));
     }
 }

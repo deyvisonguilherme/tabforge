@@ -71,6 +71,9 @@ cargo run -p tabforge-cli -- stems musica.mp3 -o ./meus_stems
 
 # 3. Exportar partitura para abrir no Guitar Pro ou MuseScore
 cargo run -p tabforge-cli -- score musica.mp3 -o partitura.musicxml
+
+# 4. Transcrever música com fórmula de compasso personalizada (ex: 3/4, 6/8, 7/8)
+cargo run -p tabforge-cli -- transcribe riff.wav --time-signature 7/8
 ```
 
 ---
@@ -105,6 +108,7 @@ tabforge transcribe <INPUT> [OPTIONS]
 | `-o, --output <FILE>` | *None* | Arquivo de saída opcional. O formato é inferido pela extensão (`.musicxml`, `.mid`, `.txt`). Se omitido, imprime a tablatura ASCII no terminal. |
 | `--separate` | `false` | Ativa a separação de fontes (isolamento do instrumento) antes de transcrever. |
 | `--stem <STEM>` | `guitar` | Stem a ser transcrito se `--separate` estiver ativo (`guitar`, `bass`, `vocals`, `other`). |
+| `--time-signature <TS>` | *Auto* | Força uma fórmula de compasso manual (ex: `4/4`, `3/4`, `6/8`, `7/8`), ajustando a quantização e os limites de compasso. |
 
 #### Exemplos de Uso:
 
@@ -120,6 +124,12 @@ tabforge transcribe musica.flac --separate --stem bass -i bass -o baixo.mid
 
 # Transcrever e gerar arquivo MusicXML para Guitar Pro:
 tabforge transcribe solo.mp3 --separate -o solo.musicxml
+
+# Transcrever uma valsa em 3/4 com quantização métrica adaptada:
+tabforge transcribe valsa.mp3 --time-signature 3/4
+
+# Transcrever riff progressivo em 7/8 com separação de stem e exportação para MusicXML:
+tabforge transcribe prog_riff.wav --time-signature 7/8 --separate --stem guitar -o prog.musicxml
 ```
 
 ---

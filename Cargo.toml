@@ -31,6 +31,10 @@ midly = "0.5"
 symphonia = { version = "0.5", features = ["all"] }
 rustfft = "6.2"
 quick-xml = { version = "0.37", features = ["serialize"] }
+ort = { version = "2.0.0-rc.13" }
+ndarray = "0.16"
+ureq = "2.10"
+indicatif = "0.17"
 
 # Internal workspace dependencies
 tabforge-core = { path = "crates/tabforge-core" }
