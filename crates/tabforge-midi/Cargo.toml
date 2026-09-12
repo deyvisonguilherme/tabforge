@@ -1,0 +1,12 @@
+[package]
+name = "tabforge-midi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tabforge-core = { workspace = true }
+midly = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

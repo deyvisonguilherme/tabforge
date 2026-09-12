@@ -1,0 +1,13 @@
+[package]
+name = "tabforge-score"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tabforge-core = { workspace = true }
+tabforge-guitar = { workspace = true }
+quick-xml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

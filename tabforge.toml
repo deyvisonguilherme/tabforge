@@ -1,0 +1,26 @@
+# TabForge - Configuração Padrão
+
+[transcription]
+sample_rate = 44100
+hop_size = 512
+window_size = 2048
+tolerance_cents = 25.0
+min_frequency = 60.0
+max_frequency = 1200.0
+
+[guitar]
+strings = 6
+frets = 24
+tuning = ["E2", "A2", "D3", "G3", "B3", "E4"]
+preferred_fret_range = [0, 12]
+
+[quantization]
+enabled = true
+min_subdivision = "1/16"
+swing = 0.0
+tolerance_ms = 35.0
+
+[export]
+default_format = "tab"
+musicxml_version = "4.0"
+ascii_tab_width = 80

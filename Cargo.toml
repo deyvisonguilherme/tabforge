@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tabforge-core",
+    "crates/tabforge-audio",
+    "crates/tabforge-guitar",
+    "crates/tabforge-midi",
+    "crates/tabforge-score",
+    "crates/tabforge-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["TabForge Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tabforge/tabforge"
+
+[workspace.dependencies]
+num-rational = { version = "0.4", features = ["serde"] }
+num-traits = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.5", features = ["derive", "cargo"] }
+midly = "0.5"
+symphonia = { version = "0.5", features = ["all"] }
+rustfft = "6.2"
+quick-xml = { version = "0.37", features = ["serialize"] }
+
+# Internal workspace dependencies
+tabforge-core = { path = "crates/tabforge-core" }
+tabforge-audio = { path = "crates/tabforge-audio" }
+tabforge-guitar = { path = "crates/tabforge-guitar" }
+tabforge-midi = { path = "crates/tabforge-midi" }
+tabforge-score = { path = "crates/tabforge-score" }
