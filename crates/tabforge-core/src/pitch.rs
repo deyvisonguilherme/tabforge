@@ -81,6 +81,16 @@ pub struct Pitch {
 }
 
 impl Pitch {
+    pub const C4: Self = Self { midi: 60 };
+    pub const A4: Self = Self { midi: 69 };
+    // Standard 6-string guitar tuning pitches
+    pub const E2: Self = Self { midi: 40 };
+    pub const A2: Self = Self { midi: 45 };
+    pub const D3: Self = Self { midi: 50 };
+    pub const G3: Self = Self { midi: 55 };
+    pub const B3: Self = Self { midi: 59 };
+    pub const E4: Self = Self { midi: 64 };
+
     /// Creates a pitch from a standard MIDI note number (0 to 127)
     pub fn from_midi(midi: u8) -> Result<Self> {
         if midi > 127 {

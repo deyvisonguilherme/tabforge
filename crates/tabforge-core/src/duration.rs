@@ -40,6 +40,11 @@ impl Duration {
         *self.0.numer() as f64 / *self.0.denom() as f64
     }
 
+    /// Convert duration to quarter-note units (1/4 = 1.0, 1/1 = 4.0)
+    pub fn to_quarter_notes(&self) -> f64 {
+        self.as_f64() * 4.0
+    }
+
     /// Add a dot to the duration (1.5x length)
     pub fn dotted(self) -> Self {
         Self(self.0 * Rational32::new(3, 2))

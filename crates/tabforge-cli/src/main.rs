@@ -32,10 +32,18 @@ fn main() -> Result<()> {
             input,
             instrument,
             output,
-        } => commands::transcribe::execute(input, instrument, output.as_deref())?,
+            separate,
+            stem,
+        } => commands::transcribe::execute(input, instrument, output.as_deref(), *separate, stem)?,
+        Commands::Stems {
+            input,
+            output_dir,
+            model,
+        } => commands::stems::execute(input, output_dir.as_deref(), model.as_deref())?,
         Commands::Midi { input, output } => commands::midi::execute(input, output.as_deref())?,
         Commands::Score { input, output } => commands::score::execute(input, output.as_deref())?,
         Commands::Tab { input } => commands::tab::execute(input)?,
+        Commands::Models { action } => commands::models::execute(action)?,
     }
 
     Ok(())

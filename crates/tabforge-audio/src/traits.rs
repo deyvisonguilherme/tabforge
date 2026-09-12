@@ -32,6 +32,7 @@ pub struct RawNoteEvent {
     pub end_time: f64,
     pub pitch: Pitch,
     pub velocity: u8,
+    pub articulation: Option<tabforge_core::Articulation>,
 }
 
 pub trait PitchDetector: Send + Sync {
